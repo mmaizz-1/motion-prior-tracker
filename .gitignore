@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data / outputs (never commit the raw dataset)
+*.mp4
+*.xlsx
+*_annotations/
+_tracking_stats.json
+demo_out/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
