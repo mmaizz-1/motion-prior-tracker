@@ -24,6 +24,11 @@ import numpy as np
 class MotionModel:
     """Base class for pluggable motion priors."""
 
+    @property
+    def velocity(self):
+        """Current velocity in pixels per frame."""
+        return np.zeros(2, dtype=np.float64)
+
     def predict(self):
         """Predicted position for the next frame (pure — no state mutation)."""
         raise NotImplementedError
@@ -49,21 +54,66 @@ class ConstantVelocity(MotionModel):
 
     def __init__(self, initial_state):
         self.state = np.asarray(initial_state, dtype=np.float64)
-        self.velocity = np.zeros_like(self.state)
+        self._velocity = np.zeros_like(self.state)
+
+    @property
+    def velocity(self):
+        return self._velocity
 
     def predict(self):
         return self.state + self.velocity
 
     def update(self, measurement):
         m = np.asarray(measurement, dtype=np.float64)
-        self.velocity = m - self.state
+        self._velocity = m - self.state
         self.state = m
         return self.state
 
     def advance(self):
         # carry the prediction forward with velocity unchanged (== old update(pred))
-        self.state = self.state + self.velocity
+        self.state = self.state + self._velocity
         return self.state
+
+
+class ConstantAcceleration(MotionModel):
+    """Discrete constant-acceleration model over a 2D position.
+
+    State is ``[px, py, vx, vy, ax, ay]`` and all time steps use ``dt``.
+    Measurements observe position; successive position changes establish the
+    velocity and acceleration used by the prior.
+    """
+
+    def __init__(self, initial_state, dt=1.0):
+        position = np.asarray(initial_state, dtype=np.float64)
+        if position.shape != (2,):
+            raise ValueError("initial_state must contain two position values")
+        self.dt = float(dt)
+        self.state = np.array(
+            [position[0], position[1], 0.0, 0.0, 0.0, 0.0],
+            dtype=np.float64,
+        )
+
+    @property
+    def velocity(self):
+        return self.state[2:4]
+
+    def predict(self):
+        dt = self.dt
+        return self.state[:2] + self.state[2:4] * dt + 0.5 * self.state[4:6] * dt * dt
+
+    def update(self, measurement):
+        position = np.asarray(measurement, dtype=np.float64)
+        if position.shape != (2,):
+            raise ValueError("measurement must contain two position values")
+        previous_velocity = self.state[2:4].copy()
+        velocity = (position - self.state[:2]) / self.dt
+        acceleration = (velocity - previous_velocity) / self.dt
+        self.state = np.r_[position, velocity, acceleration]
+        return self.state[:2]
+
+    def advance(self):
+        self.state[:2] = self.predict()
+        return self.state[:2]
 
 
 class KalmanFilter(MotionModel):
@@ -124,6 +174,10 @@ class KalmanFilter(MotionModel):
         self.P = np.diag([pos_std ** 2, pos_std ** 2,
                           vel_std ** 2, vel_std ** 2])
 
+    @property
+    def velocity(self):
+        return self.x[2:4]
+
     def _time_update(self):
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
@@ -152,8 +206,7 @@ class KalmanFilter(MotionModel):
 _REGISTRY = {
     "ConstantVelocity": ConstantVelocity,
     "KalmanFilter": KalmanFilter,
-    # Roadmap (coming next):
-    #   "ConstantAcceleration" — x'' = const
+    "ConstantAcceleration": ConstantAcceleration,
     #   "BirdFlight"           — bird flight dynamics prior (the research novelty)
     #   "Projectile"           — ballistic prior (proves the framework is general)
 }

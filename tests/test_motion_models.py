@@ -54,9 +54,41 @@ def test_failure_branch_advance_carries_prediction_forward():
 def test_unknown_model_raises():
     try:
         make_motion_model("Nope", [0, 0])
-    except ValueError:
+    except ValueError as exc:
+        assert "ConstantAcceleration" in str(exc)
         return
     raise AssertionError("expected ValueError for unknown model")
+
+
+def test_constant_acceleration_predicts_constant_acceleration_trajectory():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+
+    assert np.allclose(model.state, [3.0, 3.0, 2.0, 2.0, 1.0, 1.0])
+    assert np.allclose(model.predict(), [5.5, 5.5])
+
+
+def test_constant_acceleration_advance_matches_predict():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+    predicted = model.predict()
+
+    advanced = model.advance()
+
+    assert np.allclose(advanced, predicted)
+    assert np.allclose(model.state[:2], predicted)
+
+
+def test_motion_models_expose_velocity():
+    constant_velocity = make_motion_model("ConstantVelocity", [0.0, 0.0])
+    kalman = make_motion_model("KalmanFilter", [0.0, 0.0])
+    acceleration = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+
+    assert np.allclose(constant_velocity.velocity, [0.0, 0.0])
+    assert np.allclose(kalman.velocity, [0.0, 0.0])
+    assert np.allclose(acceleration.velocity, [0.0, 0.0])
 
 
 def test_kalman_registered_and_instantiable():
