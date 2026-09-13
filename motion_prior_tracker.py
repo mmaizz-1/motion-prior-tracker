@@ -311,7 +311,7 @@ def process_folder(folder_path, output_base):
                 bird_cy = pred_center[1] + bird_off_y
                 bird_w_px = ref_tw * smooth_scale
                 bird_h_px = ref_th * smooth_scale
-                motion_model.update(pred_center)  # carry prediction forward (velocity unchanged)
+                motion_model.advance()  # no measurement: carry the prediction forward
                 consecutive_fail += 1
                 predicted += 1
 
