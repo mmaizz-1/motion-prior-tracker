@@ -112,7 +112,9 @@ class ConstantAcceleration(MotionModel):
         return self.state[:2]
 
     def advance(self):
+        dt = self.dt
         self.state[:2] = self.predict()
+        self.state[2:4] += self.state[4:6] * dt
         return self.state[:2]
 
 

@@ -81,6 +81,20 @@ def test_constant_acceleration_advance_matches_predict():
     assert np.allclose(model.state[:2], predicted)
 
 
+def test_constant_acceleration_consecutive_advances_propagate_velocity():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+
+    first = model.advance().copy()
+    second = model.advance()
+
+    assert np.allclose(first, [5.5, 5.5])
+    assert np.allclose(model.state[:2], [9.0, 9.0])
+    assert np.allclose(model.velocity, [4.0, 4.0])
+    assert np.allclose(model.state[4:6], [1.0, 1.0])
+
+
 def test_motion_models_expose_velocity():
     constant_velocity = make_motion_model("ConstantVelocity", [0.0, 0.0])
     kalman = make_motion_model("KalmanFilter", [0.0, 0.0])
