@@ -1,0 +1,104 @@
+[
+  {
+    "sequence": "box_constant",
+    "model": "ConstantVelocity",
+    "frames": 28,
+    "visible_mean_iou": 0.9999999999999989,
+    "visible_mean_center_error_px": 0.0,
+    "hidden_mean_center_error_px": 0.0,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  },
+  {
+    "sequence": "box_constant",
+    "model": "KalmanFilter",
+    "frames": 28,
+    "visible_mean_iou": 0.9687617634944697,
+    "visible_mean_center_error_px": 0.2969669730763589,
+    "hidden_mean_center_error_px": 0.06591121607121775,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  },
+  {
+    "sequence": "box_constant",
+    "model": "ConstantAcceleration",
+    "frames": 28,
+    "visible_mean_iou": 0.9999999999999989,
+    "visible_mean_center_error_px": 0.0,
+    "hidden_mean_center_error_px": 0.0,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  },
+  {
+    "sequence": "ball_accelerating",
+    "model": "ConstantVelocity",
+    "frames": 28,
+    "visible_mean_iou": 0.9999999999999993,
+    "visible_mean_center_error_px": 0.0,
+    "hidden_mean_center_error_px": 4.42743615312958,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  },
+  {
+    "sequence": "ball_accelerating",
+    "model": "KalmanFilter",
+    "frames": 28,
+    "visible_mean_iou": 0.7136457058689918,
+    "visible_mean_center_error_px": 3.3056719757012245,
+    "hidden_mean_center_error_px": 11.548865564127997,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  },
+  {
+    "sequence": "ball_accelerating",
+    "model": "ConstantAcceleration",
+    "frames": 28,
+    "visible_mean_iou": 0.9999999999999993,
+    "visible_mean_center_error_px": 0.0,
+    "hidden_mean_center_error_px": 8.636764205076705,
+    "predicted_frames": [
+      12,
+      13,
+      14,
+      15
+    ],
+    "recovered_frames": [
+      16
+    ]
+  }
+]
