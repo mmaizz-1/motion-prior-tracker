@@ -1,6 +1,6 @@
 # 通用目标跟踪器：实施与验证记录
 
-更新时间：2026-09-14。设计与实施工作已完成，最终代码保存在本地 `feature/generalize-target-tracker` 分支，未推送 GitHub。远程基线为 `e6345c8`，仓库为 <https://github.com/mmaizz-1/motion-prior-tracker>。
+更新时间：2026-09-14。设计与实施工作已完成，开发分支为 `feature/generalize-target-tracker`。远程基线为 `e6345c8`，仓库为 <https://github.com/mmaizz-1/motion-prior-tracker>。本报告记录实施与验证结果；发布及合并状态以仓库分支和拉取请求为准。
 
 ## 这次完成了什么
 

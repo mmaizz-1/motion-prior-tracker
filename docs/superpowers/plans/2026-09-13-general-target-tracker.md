@@ -141,4 +141,4 @@ All three tasks are complete. Final verification: 108 tests passed using real Op
 
 Implementation was split into tracking_types.py, template_matching.py, sequence_io.py and tracking_cli.py while retaining public exports from motion_prior_tracker.py. Review added stricter unpadded-target validation, a three-pixel initialization minimum, full scale-aware search windows, and corrected acceleration estimation across unequal measurement gaps. The attention adapter and reproducible synthetic demo are executable examples.
 
-See ../../implementation-report-2026-09-14.md for the final implementation choices, evidence and limitations. Changes are saved on the local feature branch; no remote push was performed.
+See ../../implementation-report-2026-09-14.md for the final implementation choices, evidence and limitations. The development branch is feature/generalize-target-tracker; consult GitHub for publication and merge status.
