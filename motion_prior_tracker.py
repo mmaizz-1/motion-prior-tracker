@@ -1,293 +1,235 @@
-"""Generic template tracker with pluggable motion priors."""
-import argparse
-import glob
+"""Class-independent, initialized single-object tracking with motion priors.
+
+One update is one uniformly sampled frame. A detector can provide the initial
+normalized box; this component estimates that selected object's subsequent state.
+"""
+from pathlib import Path
 import json
-import os
-from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
-try:
-    import cv2
-except ImportError:  # array-only use does not require OpenCV
-    cv2 = None
+
 from motion_models import make_motion_model
-
-INPUT_BASE = r"C:\Users\Lenovo\Desktop\标注1"
-OUTPUT_BASE = r"C:\Users\Lenovo\Desktop\标注1_annotations"
-BIRD_CLASS = 15
-MOTION_MODEL = "ConstantVelocity"
-CONTEXT_MARGIN, SEARCH_RADIUS, BIRD_PAD, FINE_MARGIN = 2, 200, 4, 80
-N_SCALES, SCALE_RANGE, SCALE_EMA = 50, (0.5, 1.5), 0.35
-MATCH_THRESH, BIRD_THRESH, TEMPLATE_EMA = 0.35, 0.15, 0.3
-TARGET_THRESH, REACQ_INTERVAL, REACQ_SCALE = BIRD_THRESH, 10, 0.25
-DENSE_SCALES = np.linspace(*SCALE_RANGE, N_SCALES)
-
-
-def _validate_bbox(bbox: Sequence[float]) -> Tuple[float, float, float, float]:
-    if bbox is None or len(bbox) != 4:
-        raise ValueError("bbox_xywh must contain four normalized values")
-    values = tuple(float(v) for v in bbox)
-    cx, cy, w, h = values
-    if not all(np.isfinite(values)) or w <= 0 or h <= 0 or not (0 <= cx <= 1 and 0 <= cy <= 1 and w <= 1 and h <= 1):
-        raise ValueError("bbox_xywh must contain finite normalized values and positive dimensions")
-    return values
-
-
-@dataclass
-class TargetSpec:
-    class_id: int = 0
-    bbox_xywh: Optional[Sequence[float]] = None
-    initial_bbox_xywh: Optional[Sequence[float]] = None
-    template_padding: int = BIRD_PAD
-    context_margin: float = CONTEXT_MARGIN
-    search_radius: int = SEARCH_RADIUS
-    fine_margin: int = FINE_MARGIN
-    scale_range: Tuple[float, float] = SCALE_RANGE
-    match_thresh: float = MATCH_THRESH
-    target_thresh: float = TARGET_THRESH
-
-    def __post_init__(self):
-        if self.bbox_xywh is None:
-            self.bbox_xywh = self.initial_bbox_xywh
-        if self.bbox_xywh is not None:
-            self.bbox_xywh = _validate_bbox(self.bbox_xywh)
-        if int(self.class_id) < 0 or self.template_padding < 0 or self.search_radius < 0 or self.fine_margin < 0:
-            raise ValueError("class_id and dimensions must be non-negative")
-        if self.scale_range[0] <= 0 or self.scale_range[1] < self.scale_range[0]:
-            raise ValueError("scale_range must be positive and ordered")
-
-
-@dataclass
-class TrackerConfig:
-    motion_model_name: str = MOTION_MODEL
-    template_ema: float = TEMPLATE_EMA
-    reacq_interval: int = REACQ_INTERVAL
-    reacq_scale: float = REACQ_SCALE
-    context_scales: Tuple[float, ...] = (0.88, 0.94, 1.0, 1.06, 1.12)
-    telemetry_path: Optional[str] = None
-    yolo_output: bool = False
-    search_radius: Optional[int] = None
-    fine_margin: Optional[int] = None
-
-    @property
-    def model_name(self):
-        return self.motion_model_name
-
-
-@dataclass(frozen=True)
-class TrackObservation:
-    frame_index: int
-    bbox_xywh: Tuple[float, float, float, float]
-    center_px: Tuple[float, float]
-    velocity_px: Tuple[float, float]
-    score: float
-    mode: str
-    lost_frames: int
-    class_id: int
-    image_size: Tuple[int, int]
-
-    def to_dict(self):
-        return {"frame_index": int(self.frame_index), "bbox_xywh": [float(v) for v in self.bbox_xywh],
-                "center_px": [float(v) for v in self.center_px], "velocity_px": [float(v) for v in self.velocity_px],
-                "score": float(self.score), "mode": self.mode, "lost_frames": int(self.lost_frames),
-                "class_id": int(self.class_id), "image_size": [int(v) for v in self.image_size]}
+from tracking_types import (
+    TargetSpec, TrackerConfig, TrackObservation, clamp_norm, integer, validate_bbox,
+)
+from template_matching import (
+    crop_at, validate_image, multi_scale_match, dense_scale_match, full_image_search,
+)
 
 
 def imread(path):
-    if cv2 is None:
-        raise RuntimeError("opencv-python is required to read image paths")
-    return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-
-def clamp_norm(cx, cy, bw, bh):
-    return [max(0.0003, min(0.9997, float(cx))), max(0.0003, min(0.9997, float(cy))),
-            max(0.0002, min(0.9998, float(bw))), max(0.0002, min(0.9998, float(bh)))]
-
-
-def _resize(image, size):
-    width, height = map(int, size)
-    if cv2 is not None:
-        return cv2.resize(image, (width, height))
-    ys = np.linspace(0, image.shape[0] - 1, height).astype(int)
-    xs = np.linspace(0, image.shape[1] - 1, width).astype(int)
-    return image[np.ix_(ys, xs)]
-
-
-def _match_template(search, template):
-    if search.size == 0 or template.size == 0:
-        return -1.0, (0, 0)
-    if cv2 is not None:
-        result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-        _, value, _, loc = cv2.minMaxLoc(result)
-        return float(value), loc
-    a = search.mean(2) if search.ndim == 3 else search
-    b = template.mean(2) if template.ndim == 3 else template
-    th, tw = b.shape[:2]
-    if th > a.shape[0] or tw > a.shape[1]:
-        return -1.0, (0, 0)
-    b = b.astype(float) - b.mean(); nb = np.linalg.norm(b)
-    if nb < 1e-9:
-        return 0.0, (0, 0)
-    best, loc = -1.0, (0, 0)
-    for y in range(a.shape[0] - th + 1):
-        for x in range(a.shape[1] - tw + 1):
-            p = a[y:y + th, x:x + tw].astype(float); p -= p.mean(); den = np.linalg.norm(p) * nb
-            score = float((p * b).sum() / den) if den > 1e-9 else 0.0
-            if score > best:
-                best, loc = score, (x, y)
-    return best, loc
-
-
-def multi_scale_match(search_region, template, base_w, base_h, scales):
-    best = (-1.0, 0, 0, 1.0)
-    sh, sw = search_region.shape[:2]
-    for scale in scales:
-        tw, th = max(3, int(base_w * scale)), max(3, int(base_h * scale))
-        if tw > sw or th > sh:
-            continue
-        score, (x, y) = _match_template(search_region, _resize(template, (tw, th)))
-        if score > best[0]:
-            best = (score, x, y, float(scale))
-    return best
-
-
-def dense_scale_match(search_region, template, base_w, base_h, scales=None):
-    scales = DENSE_SCALES if scales is None else np.asarray(scales)
-    scores, best_score, best_idx, best_loc = [], -1.0, 0, (0, 0)
-    sh, sw = search_region.shape[:2]
-    for i, scale in enumerate(scales):
-        tw, th = max(3, int(base_w * scale)), max(3, int(base_h * scale))
-        if tw > sw or th > sh:
-            scores.append(-1.0); continue
-        score, loc = _match_template(search_region, _resize(template, (tw, th)))
-        scores.append(score)
-        if score > best_score:
-            best_score, best_idx, best_loc = score, i, loc
-    interp = float(scales[best_idx]) if len(scales) else 1.0
-    if 0 < best_idx < len(scales) - 1:
-        s0, s1, s2 = scores[best_idx - 1:best_idx + 2]; denom = 2 * (2 * s1 - s0 - s2)
-        if s1 > s0 and s1 > s2 and abs(denom) > 1e-8:
-            interp += float((s2 - s0) / denom) * float(scales[1] - scales[0])
-    return best_score, best_loc[0], best_loc[1], interp
-
-
-def full_image_search(img, template, base_w, base_h, search_scale):
-    H, W = img.shape[:2]
-    small = _resize(img, (max(1, W * search_scale), max(1, H * search_scale)))
-    tmpl = _resize(template, (max(3, base_w * search_scale), max(3, base_h * search_scale)))
-    score, (x, y) = _match_template(small, tmpl)
-    return (score, int(x / search_scale), int(y / search_scale), 1.0) if score > MATCH_THRESH * 0.7 else (score, 0, 0, 1.0)
+    """Read a BGR image, including Windows paths containing Chinese characters."""
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+    except (OSError, cv2.error) as exc:
+        raise ValueError(f'Cannot read image: {path}') from exc
+    if image is None:
+        raise ValueError(f'Cannot decode image: {path}')
+    return image
 
 
 class MotionPriorTracker:
-    def __init__(self, target_spec: TargetSpec, config: Optional[TrackerConfig] = None):
-        self.target, self.config = target_spec, config or TrackerConfig()
-        self.initialized, self.frame_index, self.lost_frames = False, -1, 0
+    """One selected target per instance; no bird-specific class logic."""
+
+    def __init__(self, target_spec=None, config=None):
+        self.target = target_spec or TargetSpec()
+        self.config = config or TrackerConfig()
+        self.initialized = False
+        self.frame_index = -1
+        self.lost_frames = 0
+        self.search_radius = (self.target.search_radius if self.config.search_radius is None
+                              else self.config.search_radius)
+        self.fine_margin = (self.target.fine_margin if self.config.fine_margin is None
+                            else self.config.fine_margin)
 
     def initialize(self, image, bbox_xywh=None):
-        if image is None or not hasattr(image, "shape") or image.ndim < 2:
-            raise ValueError("image must be a non-empty array")
-        H, W = image.shape[:2]; bbox = _validate_bbox(bbox_xywh if bbox_xywh is not None else self.target.bbox_xywh)
-        if bbox_xywh is not None:
-            self.target.bbox_xywh = bbox
-        cx, cy, bw, bh = bbox; px_cx, px_cy = cx * W, cy * H
-        self.image_size, self.ref_bbox = (W, H), bbox
-        self.target_w, self.target_h = max(3, int(bw * W)), max(3, int(bh * H)); pad = int(self.target.template_padding)
-        x1, y1 = max(0, int(px_cx - self.target_w / 2) - pad), max(0, int(px_cy - self.target_h / 2) - pad)
-        x2, y2 = min(W, int(px_cx + self.target_w / 2) + pad), min(H, int(px_cy + self.target_h / 2) + pad)
-        self.target_template = image[y1:y2, x1:x2].copy()
-        self.ref_th, self.ref_tw = self.target_template.shape[:2]
-        self.ctx_w, self.ctx_h = max(20, int(self.target_w * (1 + 2 * self.target.context_margin))), max(20, int(self.target_h * (1 + 2 * self.target.context_margin)))
-        cx1, cy1 = max(0, min(int(px_cx - self.ctx_w / 2), W - self.ctx_w)), max(0, min(int(px_cy - self.ctx_h / 2), H - self.ctx_h))
-        self.target_offset = np.array([px_cx - (cx1 + self.ctx_w / 2), px_cy - (cy1 + self.ctx_h / 2)])
-        self.context_template = image[cy1:cy1 + self.ctx_h, cx1:cx1 + self.ctx_w].copy()
-        self.original_context_template = self.context_template.copy()
-        self.motion_model = make_motion_model(self.config.motion_model_name, [cx1 + self.ctx_w / 2, cy1 + self.ctx_h / 2])
-        self.smooth_scale, self.frame_index, self.lost_frames, self.initialized = 1.0, 0, 0, True
-        return self._observation(0, bbox, [px_cx, px_cy], 1.0, "ref")
+        validate_image(image)
+        bbox = validate_bbox(self.target.bbox_xywh if bbox_xywh is None else bbox_xywh)
+        h, w = image.shape[:2]
+        bbox = clamp_norm(*bbox)
+        center = np.array([bbox[0] * w, bbox[1] * h])
+        size = np.array([bbox[2] * w, bbox[3] * h])
+        if np.any(size < 3 - 1e-7):
+            raise ValueError('initial target needs at least three pixels in each dimension')
+        padding = self.target.template_padding
+        target_template, target_origin = crop_at(image, center - size/2 - padding, size + 2*padding)
+        ctx_size = np.maximum(20., size * (1 + 2 * self.target.context_margin))
+        context_template, context_origin = crop_at(image, center - ctx_size/2, ctx_size)
+        self.motion_model = make_motion_model(self.config.motion_model_name, center)
+        self.target_template = target_template.copy()
+        self.original_target_template = target_template.copy()
+        self.context_template = context_template.copy()
+        self.original_context_template = context_template.copy()
+        self.target_anchor = center - target_origin
+        self.context_anchor = center - context_origin
+        self.ref_th, self.ref_tw = target_template.shape[:2]
+        self.ctx_h, self.ctx_w = context_template.shape[:2]
+        self.reference_size = size
+        self.object_template = self._object_patch(image, center, 1.)
+        self.original_object_template = self.object_template.copy()
+        self.image_size = (w, h)
+        self.image_shape = image.shape
+        self.smooth_scale = 1.
+        self.frame_index = 0
+        self.lost_frames = 0
+        self.initialized = True
+        return self._observation(center, 1., 'ref')
 
-    def _observation(self, index, bbox, center, score, mode):
-        velocity = np.asarray(self.motion_model.velocity, dtype=float)
-        return TrackObservation(index, tuple(clamp_norm(*bbox)), (float(center[0]), float(center[1])), (float(velocity[0]), float(velocity[1])), float(max(0.0, score)), mode, self.lost_frames, int(self.target.class_id), tuple(self.image_size[::-1]))
+    def _object_patch(self, image, center, scale):
+        size = tuple(int(max(1, round(v * scale))) for v in self.reference_size)
+        # Box coordinates describe pixel edges; OpenCV samples pixel centers.
+        return cv2.getRectSubPix(image, size, tuple(float(v-.5) for v in center))
+
+    def _observation(self, center, score, mode):
+        w, h = self.image_size
+        size = self.reference_size * self.smooth_scale
+        box = clamp_norm(center[0]/w, center[1]/h, size[0]/w, size[1]/h)
+        return TrackObservation(
+            frame_index=self.frame_index, bbox_xywh=tuple(box),
+            center_px=(box[0]*w, box[1]*h),
+            velocity_px=tuple(float(v) for v in self.motion_model.velocity),
+            score=float(np.clip(score, 0, 1)), mode=mode,
+            lost_frames=self.lost_frames, class_id=self.target.class_id,
+            image_size=self.image_size,
+        )
+
+    def _locate(self, image, search_center, radius, original=False):
+        """A candidate requires BOTH context and target evidence."""
+        context = self.original_context_template if original else self.context_template
+        target = self.original_target_template if original else self.target_template
+        extent = np.array([self.ctx_w, self.ctx_h])
+        origin = search_center - self.context_anchor * max(self.config.context_scales) - radius
+        size = extent * max(self.config.context_scales) + 2*radius
+        region, region_origin = crop_at(image, origin, size)
+        context_score, x, y, context_scale = multi_scale_match(
+            region, context, self.ctx_w, self.ctx_h, self.config.context_scales)
+        if context_score <= self.target.match_thresh:
+            return None
+        context_origin = region_origin + [x, y]
+        approximate = context_origin + self.context_anchor * context_scale
+        template_size = np.array([self.ref_tw, self.ref_th])
+        fine_origin = approximate - self.target_anchor * max(self.target.scale_range) - self.fine_margin
+        fine_size = template_size * max(self.target.scale_range) + 2*self.fine_margin
+        fine_region, fine_origin = crop_at(image, fine_origin, fine_size)
+        lo, hi = self.target.scale_range
+        scales = np.unique(np.linspace(lo, hi, self.config.n_scales))
+        target_score, tx, ty, scale = dense_scale_match(
+            fine_region, target, self.ref_tw, self.ref_th, scales)
+        if target_score <= self.target.target_thresh:
+            return None
+        measured_center = fine_origin + [tx, ty] + self.target_anchor * scale
+        object_size = self.reference_size * scale
+        if np.any(measured_center - object_size/2 < 0) or np.any(measured_center + object_size/2 > self.image_size):
+            return None
+        reference = self.original_object_template if original else self.object_template
+        patch = self._object_patch(image, measured_center, scale)
+        patch = cv2.resize(patch, (reference.shape[1], reference.shape[0])).astype(float)
+        reference = reference.astype(float)
+        energy = float(np.sqrt(np.sum(patch**2) * np.sum(reference**2)))
+        squared_error = (patch-reference)**2
+        if energy > 1e-8:
+            object_score = 1 - float(np.sum(squared_error)) / energy
+        else:
+            # Near-black compression/interpolation noise gets a small absolute
+            # tolerance. The full 255-level range would accept missing black
+            # objects against unrelated medium-intensity padded backgrounds.
+            object_score = 1 - float(np.sqrt(np.mean(squared_error))) / 16.
+        # Padded background must never be the sole evidence for object presence.
+        # Squared-difference similarity also works for solid-color object crops.
+        if object_score <= self.target.target_thresh:
+            return None
+        return measured_center, scale, min(context_score, target_score, object_score), context_scale
+
+    def _refresh_templates(self, image, center, target_scale, context_scale):
+        rate = self.config.template_ema
+        if rate == 0:
+            return
+        for name, anchor, size, scale in (
+            ('target_template', self.target_anchor, [self.ref_tw, self.ref_th], target_scale),
+            ('context_template', self.context_anchor, [self.ctx_w, self.ctx_h], context_scale),
+        ):
+            crop, _ = crop_at(image, center - anchor * scale, np.asarray(size) * scale)
+            if crop.size:
+                refreshed = cv2.resize(crop, tuple(size))
+                setattr(self, name, cv2.addWeighted(getattr(self, name), 1-rate, refreshed, rate, 0))
+        patch = self._object_patch(image, center, target_scale)
+        refreshed = cv2.resize(patch, (self.object_template.shape[1], self.object_template.shape[0]))
+        self.object_template = cv2.addWeighted(self.object_template, 1-rate, refreshed, rate, 0)
 
     def update(self, image, frame_index=None):
         if not self.initialized:
-            raise ValueError("tracker must be initialized before update")
-        H, W = image.shape[:2]; idx = self.frame_index + 1 if frame_index is None else int(frame_index)
-        pred = np.asarray(self.motion_model.predict(), dtype=float)
-        search_radius = self.config.search_radius if self.config.search_radius is not None else self.target.search_radius
-        fine_margin = self.config.fine_margin if self.config.fine_margin is not None else self.target.fine_margin
-        sx1, sy1 = max(0, int(pred[0] - self.ctx_w / 2 - search_radius)), max(0, int(pred[1] - self.ctx_h / 2 - search_radius))
-        sx2, sy2 = min(W, int(pred[0] + self.ctx_w / 2 + search_radius)), min(H, int(pred[1] + self.ctx_h / 2 + search_radius))
-        context_score, lx, ly, cscale = multi_scale_match(image[sy1:sy2, sx1:sx2], self.context_template, self.ctx_w, self.ctx_h, self.config.context_scales)
-        center, out_w, out_h, target_score, mode = pred + self.target_offset, self.target_w, self.target_h, -1.0, "predicted"
-        matched = False
-        if context_score >= self.target.match_thresh:
-            ctx_x, ctx_y = sx1 + lx, sy1 + ly; approx = np.array([ctx_x + self.ctx_w * cscale / 2 + self.target_offset[0] * cscale, ctx_y + self.ctx_h * cscale / 2 + self.target_offset[1] * cscale])
-            fx1, fy1, fx2, fy2 = max(0, int(approx[0] - fine_margin)), max(0, int(approx[1] - fine_margin)), min(W, int(approx[0] + fine_margin)), min(H, int(approx[1] + fine_margin))
-            target_score, tx, ty, raw = dense_scale_match(image[fy1:fy2, fx1:fx2], self.target_template, self.ref_tw, self.ref_th, np.linspace(*self.target.scale_range, N_SCALES))
-            if target_score >= self.target.target_thresh:
-                matched = True; self.smooth_scale = max(self.target.scale_range[0], min(self.target.scale_range[1], self.config.template_ema * raw + (1 - self.config.template_ema) * self.smooth_scale)); out_w, out_h = self.target_w * self.smooth_scale, self.target_h * self.smooth_scale
-                center = np.array([fx1 + tx + self.ref_tw * raw / 2, fy1 + ty + self.ref_th * raw / 2]); self.motion_model.update(np.array([ctx_x + self.ctx_w * cscale / 2, ctx_y + self.ctx_h * cscale / 2])); mode = "recovered" if self.lost_frames else "matched"; self.lost_frames = 0
-        if not matched and self.lost_frames > 0 and self.config.reacq_interval > 0 and self.lost_frames % self.config.reacq_interval == 0:
-            original = getattr(self, "original_context_template", self.context_template)
-            reacq_score, rx, ry, rs = full_image_search(image, original, self.ctx_w, self.ctx_h, self.config.reacq_scale)
-            if reacq_score >= self.target.match_thresh * 0.7:
-                fx1, fy1 = max(0, rx - fine_margin), max(0, ry - fine_margin)
-                fx2, fy2 = min(W, rx + self.ctx_w + fine_margin), min(H, ry + self.ctx_h + fine_margin)
-                score2, lx2, ly2, scale2 = multi_scale_match(image[fy1:fy2, fx1:fx2], original, self.ctx_w, self.ctx_h, self.config.context_scales)
-                if score2 >= context_score:
-                    ctx_x, ctx_y = fx1 + lx2, fy1 + ly2
-                    center = np.array([ctx_x + self.ctx_w * scale2 / 2 + self.target_offset[0] * scale2, ctx_y + self.ctx_h * scale2 / 2 + self.target_offset[1] * scale2])
-                    context_score = score2
-                    self.motion_model.update(np.array([ctx_x + self.ctx_w * scale2 / 2, ctx_y + self.ctx_h * scale2 / 2]))
-                    self.lost_frames = 0
-                    mode = "recovered"
-                    matched = True
-        if not matched:
-            self.motion_model.advance(); self.lost_frames += 1
-        self.frame_index, self.image_size = idx, (W, H)
-        return self._observation(idx, (center[0] / W, center[1] / H, out_w / W, out_h / H), center, max(context_score, target_score), mode)
+            raise ValueError('tracker must be initialized before update')
+        validate_image(image)
+        if image.shape != self.image_shape:
+            raise ValueError('image dimensions/channels changed; initialize a new sequence')
+        index = self.frame_index + 1 if frame_index is None else frame_index
+        integer(index, 'frame_index', 1)
+        if index != self.frame_index + 1:
+            raise ValueError('frame_index must advance by one; use uniformly sampled frames')
+        prediction = np.asarray(self.motion_model.predict(), dtype=float)
+        candidate = self._locate(image, prediction, self.search_radius)
+        if candidate is None and (self.lost_frames + 1) % self.config.reacq_interval == 0:
+            score, x, y, _ = full_image_search(
+                image, self.original_context_template, self.ctx_w, self.ctx_h,
+                self.config.reacq_scale)
+            if score > self.target.match_thresh * 0.7:
+                candidate = self._locate(
+                    image, np.array([x, y]) + self.context_anchor,
+                    max(self.fine_margin, int(2/self.config.reacq_scale)), original=True)
+        if candidate is None:
+            center = self.motion_model.advance()
+            self.lost_frames += 1
+            mode, score = 'predicted', 0.
+        else:
+            measurement, scale, score, context_scale = candidate
+            center = self.motion_model.update(measurement)
+            self.smooth_scale = (self.config.scale_ema * scale
+                                 + (1-self.config.scale_ema) * self.smooth_scale)
+            mode = 'recovered' if self.lost_frames else 'matched'
+            self.lost_frames = 0
+            if score >= self.config.template_update_thresh:
+                self._refresh_templates(image, measurement, scale, context_scale)
+        self.frame_index = int(index)
+        return self._observation(center, score, mode)
 
-    def track_sequence(self, images: Iterable, telemetry_path=None):
-        images = list(images)
-        if not images:
-            raise ValueError("images must contain at least one frame")
-        observations = [self.initialize(images[0])] if not self.initialized else []
-        observations.extend(self.update(image, i) for i, image in enumerate(images[1:], 1))
-        path = telemetry_path or self.config.telemetry_path
-        if path: self.write_jsonl(observations, path)
+    def track_sequence(self, images, telemetry_path=None):
+        """Process an iterable; an initialized tracker consumes every new frame."""
+        observations = []
+        for image in images:
+            observations.append(self.update(image) if self.initialized else self.initialize(image))
+        if not observations:
+            raise ValueError('images must contain at least one frame')
+        path = telemetry_path if telemetry_path is not None else self.config.telemetry_path
+        if path is not None:
+            self.write_jsonl(observations, path)
         return observations
 
     @staticmethod
     def write_jsonl(observations, path):
-        with open(path, "w", encoding="utf-8") as stream:
-            for observation in observations: stream.write(json.dumps(observation.to_dict(), ensure_ascii=False) + "\n")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as stream:
+            for observation in observations:
+                stream.write(json.dumps(observation.to_dict(), ensure_ascii=False, allow_nan=False) + '\n')
 
-    def write_yolo(self, observation, path):
-        with open(path, "w", encoding="utf-8") as stream: stream.write(f"{observation.class_id} {' '.join(f'{v:.6f}' for v in observation.bbox_xywh)}\n")
+    @staticmethod
+    def write_yolo(observation, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{observation.class_id} " + ' '.join(f'{v:.6f}' for v in observation.bbox_xywh) + '\n', encoding='utf-8')
 
 
 def process_folder(folder_path, output_base, target_spec=None, config=None, telemetry_path=None):
-    folder_name = os.path.basename(folder_path); images = sorted(glob.glob(os.path.join(folder_path, "*.jpg")))
-    if not images: print(f"  [{folder_name}] No images, skipping"); return None
-    first = os.path.splitext(os.path.basename(images[0]))[0]; ref_txt = os.path.join(folder_path, first + ".txt")
-    if not os.path.exists(ref_txt): print(f"  [{folder_name}] No reference txt, skipping"); return None
-    with open(ref_txt, encoding="utf-8") as stream: parts = stream.readline().strip().split()
-    if len(parts) < 5: raise ValueError(f"invalid reference label: {ref_txt}")
-    spec = target_spec or TargetSpec(class_id=int(parts[0]), bbox_xywh=[float(v) for v in parts[1:5]])
-    tracker = MotionPriorTracker(spec, config or TrackerConfig(telemetry_path=telemetry_path)); observations = tracker.track_sequence([imread(path) for path in images])
-    out_folder = os.path.join(output_base, folder_name); os.makedirs(out_folder, exist_ok=True)
-    for path, observation in zip(images, observations): tracker.write_yolo(observation, os.path.join(out_folder, os.path.splitext(os.path.basename(path))[0] + ".txt"))
-    if telemetry_path: tracker.write_jsonl(observations, telemetry_path)
-    widths, heights = [o.bbox_xywh[2] for o in observations], [o.bbox_xywh[3] for o in observations]
-    return {"folder": folder_name, "total": len(observations), "matched": sum(o.mode == "matched" for o in observations), "predicted": sum(o.mode == "predicted" for o in observations), "recovered": sum(o.mode == "recovered" for o in observations), "match_rate": sum(o.mode == "matched" for o in observations) / len(observations), "elapsed": 0.0, "fps": 0.0, "w_mean": float(np.mean(widths)), "w_std": float(np.std(widths)), "h_mean": float(np.mean(heights)), "h_std": float(np.std(heights)), "w_unique": len(set(round(v, 8) for v in widths)), "h_unique": len(set(round(v, 8) for v in heights)), "frame_diffs": float(np.mean(np.abs(np.diff(widths)))) if len(widths) > 1 else 0.0}
+    from sequence_io import process_folder as run_folder
+    return run_folder(folder_path, output_base, target_spec, config, telemetry_path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Motion-Prior Tracker"); parser.add_argument("--input", default=INPUT_BASE); parser.add_argument("--output", default=OUTPUT_BASE); parser.add_argument("--model", default=MOTION_MODEL); args = parser.parse_args()
-    for folder in sorted(path for path in glob.glob(os.path.join(args.input, "*")) if os.path.isdir(path)): process_folder(folder, args.output, config=TrackerConfig(motion_model_name=args.model))
+def main(argv=None):
+    from tracking_cli import main as run_cli
+    return run_cli(argv)
 
 
-if __name__ == "__main__": main()
+if __name__ == '__main__':
+    raise SystemExit(main())

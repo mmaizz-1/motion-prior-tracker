@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.superpowers/
+.venv/
 
 # Data / outputs (never commit the raw dataset)
 *.mp4
