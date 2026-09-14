@@ -10,8 +10,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import pytest
 
-from motion_models import make_motion_model
+from motion_models import ConstantAcceleration, KalmanFilter, make_motion_model
 
 
 def test_constant_velocity_matches_original_hardcoded_math():
@@ -54,9 +55,140 @@ def test_failure_branch_advance_carries_prediction_forward():
 def test_unknown_model_raises():
     try:
         make_motion_model("Nope", [0, 0])
-    except ValueError:
+    except ValueError as exc:
+        assert "ConstantAcceleration" in str(exc)
         return
     raise AssertionError("expected ValueError for unknown model")
+
+
+def test_constant_acceleration_predicts_constant_acceleration_trajectory():
+    # x(t) = 0.5*t + 0.5*t**2: x(0..3) = 0, 1, 3, 6.
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+
+    assert np.allclose(model.velocity, [2.5, 2.5])
+    assert np.allclose(model.predict(), [6.0, 6.0])
+
+
+def test_constant_acceleration_advance_matches_predict():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+    predicted = model.predict()
+
+    advanced = model.advance()
+
+    assert np.allclose(advanced, predicted)
+    assert np.allclose(model.state[:2], predicted)
+
+
+def test_constant_acceleration_consecutive_advances_propagate_velocity():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+    model.update([1.0, 1.0])
+    model.update([3.0, 3.0])
+
+    first = model.advance().copy()
+    second = model.advance()
+
+    assert np.allclose(first, [6.0, 6.0])
+    assert np.allclose(second, [10.0, 10.0])
+    assert np.allclose(model.velocity, [4.5, 4.5])
+    assert np.allclose(model.state[4:6], [1.0, 1.0])
+
+
+def test_constant_acceleration_recovers_after_unequal_measurement_gaps():
+    # x(t) = t**2; y(t) = 10 - 2*t**2.
+    model = ConstantAcceleration([0.0, 10.0])
+    model.update([1.0, 8.0])  # t=1, acceleration is not yet observable
+    model.advance()          # t=2, an extrapolation is not a measurement
+    model.advance()          # t=3
+    model.update([16.0, -22.0])  # t=4, establishes acceleration over a gap
+    assert np.allclose(model.velocity, [8.0, -16.0])
+    assert np.allclose(model.predict(), [25.0, -40.0])
+
+    model.advance()          # t=5
+    model.update([36.0, -62.0])  # t=6, another interval length
+    assert np.allclose(model.velocity, [12.0, -24.0])
+    assert np.allclose(model.predict(), [49.0, -88.0])
+
+
+@pytest.mark.parametrize("dt", [0.25, 2.0])
+def test_constant_acceleration_obeys_trajectory_equations_at_nonunit_dt(dt):
+    # Independent world trajectory: p(t) = p0 + v0*t + 0.5*a*t**2.
+    p0 = np.array([7.0, -5.0])
+    v0 = np.array([-3.0, 2.0])
+    acceleration = np.array([4.0, -6.0])
+    model = ConstantAcceleration(p0, dt=dt)
+    for step in (1, 2, 3):
+        t = step * dt
+        model.update(p0 + v0 * t + 0.5 * acceleration * t**2)
+    assert np.allclose(model.velocity, v0 + acceleration * (3 * dt))
+    expected = p0 + v0 * (4 * dt) + 0.5 * acceleration * (4 * dt)**2
+    assert np.allclose(model.predict(), expected)
+    assert np.allclose(model.advance(), expected)
+
+
+def test_motion_model_factory_forwards_configuration():
+    model = make_motion_model("ConstantAcceleration", [0.0, 0.0], dt=2.0)
+    model.update([4.0, -4.0])
+    model.update([16.0, -16.0])
+    assert np.allclose(model.velocity, [8.0, -8.0])
+    assert np.allclose(model.predict(), [36.0, -36.0])
+
+
+@pytest.mark.parametrize("model_class", [ConstantAcceleration, KalmanFilter])
+@pytest.mark.parametrize("dt", [0.0, -1.0, np.nan, np.inf, -np.inf])
+def test_motion_models_reject_nonpositive_or_nonfinite_dt(model_class, dt):
+    with pytest.raises(ValueError, match="dt"):
+        model_class([0.0, 0.0], dt=dt)
+
+
+@pytest.mark.parametrize("name", ["ConstantVelocity", "ConstantAcceleration", "KalmanFilter"])
+@pytest.mark.parametrize("position", [[1.0], [[1.0, 2.0]], [1.0, 2.0, 3.0], [np.nan, 2.0], [1.0, np.inf]])
+def test_motion_models_reject_invalid_initial_positions(name, position):
+    with pytest.raises(ValueError, match="initial_state"):
+        make_motion_model(name, position)
+
+
+@pytest.mark.parametrize("name", ["ConstantVelocity", "ConstantAcceleration", "KalmanFilter"])
+@pytest.mark.parametrize("position", [[1.0], [1.0, 2.0, 3.0], [np.nan, 2.0], [1.0, np.inf]])
+def test_invalid_measurements_do_not_mutate_motion_model(name, position):
+    model = make_motion_model(name, [0.0, 0.0])
+    model.update([2.0, 4.0])
+    prediction = model.predict().copy()
+    velocity = model.velocity.copy()
+    covariance = model.P.copy() if name == "KalmanFilter" else None
+    with pytest.raises(ValueError, match="measurement"):
+        model.update(position)
+    assert np.array_equal(model.predict(), prediction)
+    assert np.array_equal(model.velocity, velocity)
+    if covariance is not None:
+        assert np.array_equal(model.P, covariance)
+
+
+@pytest.mark.parametrize("name", ["ConstantVelocity", "ConstantAcceleration", "KalmanFilter"])
+def test_caller_arrays_and_velocity_snapshots_cannot_mutate_model(name):
+    initial = np.array([1.0, 2.0])
+    model = make_motion_model(name, initial)
+    initial[:] = 99.0
+    assert np.allclose(model.predict(), [1.0, 2.0])
+    measurement = np.array([3.0, 4.0])
+    model.update(measurement)
+    prediction = model.predict().copy()
+    measurement[:] = 99.0
+    model.velocity[:] = 99.0
+    assert np.allclose(model.predict(), prediction)
+
+
+def test_motion_models_expose_velocity():
+    constant_velocity = make_motion_model("ConstantVelocity", [0.0, 0.0])
+    kalman = make_motion_model("KalmanFilter", [0.0, 0.0])
+    acceleration = make_motion_model("ConstantAcceleration", [0.0, 0.0])
+
+    assert np.allclose(constant_velocity.velocity, [0.0, 0.0])
+    assert np.allclose(kalman.velocity, [0.0, 0.0])
+    assert np.allclose(acceleration.velocity, [0.0, 0.0])
 
 
 def test_kalman_registered_and_instantiable():
@@ -103,8 +235,4 @@ def test_kalman_filter_reduces_error_on_constant_velocity():
 
 
 if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items())
-           if k.startswith("test_") and callable(v)]
-    for fn in fns:
-        fn()
-    print(f"OK: {len(fns)} tests passed")
+    raise SystemExit(pytest.main([__file__]))
